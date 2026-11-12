@@ -15,6 +15,9 @@ from threading import Timer
 # Omniverse general API
 import pxr
 import carb
+# BEGIN CUSTOM: Observe stage-open events for the PhysX preload.
+import carb.eventdispatcher
+# END CUSTOM: PhysX preload event dependency.
 import omni.ext
 import omni.usd
 import omni.kit.ui
@@ -59,6 +62,45 @@ class Pegasus_SimulatorExtension(omni.ext.IExt):
 
         # Show the window (It call the self.show_window)
         ui.Workspace.show_window(WINDOW_TITLE, show=True)
+
+        # BEGIN CUSTOM: Schedule PhysX preload when the saved MyPlot world opens.
+        context = omni.usd.get_context()
+        self._physx_preload_task = None
+        self._physx_stage_observer = carb.eventdispatcher.get_eventdispatcher().observe_event(
+            event_name=context.stage_event_name(omni.usd.StageEventType.OPENED),
+            on_event=self._schedule_physx_preload,
+            observer_name="pegasus.myplot_physx_preload",
+        )
+        self._schedule_physx_preload()
+        # END CUSTOM: Cover both new opens and the stage already open at startup.
+
+        # BEGIN CUSTOM: Preload again after Stop resets the PhysX simulation.
+        timeline = omni.timeline.get_timeline_interface()
+        self._physx_stop_subscription = timeline.get_timeline_event_stream().create_subscription_to_pop_by_type(
+            int(omni.timeline.TimelineEventType.STOP), self._schedule_physx_preload
+        )
+        # END CUSTOM: Prepare MyPlot for the next Play.
+
+    # BEGIN CUSTOM: Preload stage physics before the normal Play action.
+    def _schedule_physx_preload(self, event=None):
+        if self._physx_preload_task is not None:
+            self._physx_preload_task.cancel()
+        self._physx_preload_task = asyncio.ensure_future(self._preload_physx())
+
+    async def _preload_physx(self):
+        from omni.physx import get_physx_interface
+        from pxr import UsdPhysics
+
+        await omni.kit.app.get_app().next_update_async()
+        stage = omni.usd.get_context().get_stage()
+        if stage is None or not omni.timeline.get_timeline_interface().is_stopped():
+            return
+
+        scene = UsdPhysics.Scene.Get(stage, "/PhysicsScene")
+        if stage.GetPrimAtPath("/World/MyPlotCollection") and scene and scene.GetPrim().IsActive():
+            get_physx_interface().force_load_physics_from_usd()
+            carb.log_warning("Pegasus: preloaded MyPlot PhysX scene before Play.")
+    # END CUSTOM: MyPlot stage-open preload.
 
 
     def show_window(self, menu, show):
@@ -112,6 +154,14 @@ class Pegasus_SimulatorExtension(omni.ext.IExt):
         Callback called when the extension is shutdown
         """
         carb.log_info("Pegasus Isaac extension shutdown")
+
+        # BEGIN CUSTOM: Release the subscriptions and cancel any pending PhysX preload.
+        self._physx_stage_observer = None
+        self._physx_stop_subscription = None
+        if self._physx_preload_task is not None:
+            self._physx_preload_task.cancel()
+            self._physx_preload_task = None
+        # END CUSTOM: PhysX preload cleanup.
 
         # Destroy the isaac sim menu object
         self._menu = None

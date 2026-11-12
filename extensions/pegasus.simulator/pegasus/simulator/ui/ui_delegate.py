@@ -296,6 +296,12 @@ class UIDelegate:
                     config=config_multirotor,
                 )
 
+                # BEGIN CUSTOM: Preload PhysX after adding a vehicle to the stage.
+                from omni.physx import get_physx_interface
+
+                get_physx_interface().force_load_physics_from_usd()
+                # END CUSTOM: Prepare the terrain and spawned vehicles before Play.
+
             # Log that a vehicle of the type multirotor was spawned in the world via the extension UI
                 carb.log_info("Spawned the robot: " + selected_robot + " using the Pegasus Simulator UI")
             else:
