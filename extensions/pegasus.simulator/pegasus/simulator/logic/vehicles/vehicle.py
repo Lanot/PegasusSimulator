@@ -56,7 +56,9 @@ class Vehicle:
         sensors=[],
         graphical_sensors=[],
         graphs=[],
-        backends=[]
+        backends=[],
+        *,
+        attach_existing: bool = False,
     ):
         """
         Class that initializes a vehicle in the isaac sim's curent stage
@@ -77,23 +79,35 @@ class Vehicle:
 
         # Save the name with which the vehicle will appear in the stage
         # and the name of the .usd file that contains its description
-        self._stage_prefix = get_stage_next_free_path(self._current_stage, stage_prefix, False)
+        # BEGIN CUSTOM: Bind to a saved prim at its exact path.
+        self._stage_prefix = (
+            stage_prefix if attach_existing
+            else get_stage_next_free_path(self._current_stage, stage_prefix, False)
+        )
+        # END CUSTOM: Preserve the saved vehicle path.
         self._usd_file = usd_path
 
         # Get the vehicle name by taking the last part of vehicle stage prefix
         self._vehicle_name = self._stage_prefix.rpartition("/")[-1]
 
-        # Spawn the vehicle primitive in the world's stage
-        self._prim = stage_utils.define_prim(self._stage_prefix, "Xform")
-        self._prim = self._current_stage.GetPrimAtPath(self._stage_prefix)
-        self._prim.GetReferences().AddReference(self._usd_file)
+        # BEGIN CUSTOM: Preserve the saved vehicle reference and transform.
+        if attach_existing:
+            self._prim = self._current_stage.GetPrimAtPath(self._stage_prefix)
+            if not self._prim or not self._prim.IsActive() or not self._prim.IsA(UsdGeom.Xformable):
+                raise ValueError(f"Cannot attach to vehicle prim {self._stage_prefix}")
+        else:
+            # Spawn the vehicle primitive in the world's stage
+            self._prim = stage_utils.define_prim(self._stage_prefix, "Xform")
+            self._prim = self._current_stage.GetPrimAtPath(self._stage_prefix)
+            self._prim.GetReferences().AddReference(self._usd_file)
 
-        # Set the initial pose via the Xform API
-        xformable = UsdGeom.Xformable(self._prim)
-        xformable.ClearXformOpOrder()
-        xformable.AddTranslateOp().Set(Gf.Vec3d(init_pos[0], init_pos[1], init_pos[2]))
-        # Convert [qx, qy, qz, qw] → [qw, qx, qy, qz] for USD; use Quatf (single precision) to match the op type in NVIDIA USD assets
-        xformable.AddOrientOp().Set(Gf.Quatf(init_orientation[3], init_orientation[0], init_orientation[1], init_orientation[2]))
+            # Set the initial pose via the Xform API
+            xformable = UsdGeom.Xformable(self._prim)
+            xformable.ClearXformOpOrder()
+            xformable.AddTranslateOp().Set(Gf.Vec3d(init_pos[0], init_pos[1], init_pos[2]))
+            # Convert [qx, qy, qz, qw] → [qw, qx, qy, qz] for USD; use Quatf (single precision) to match the op type in NVIDIA USD assets
+            xformable.AddOrientOp().Set(Gf.Quatf(init_orientation[3], init_orientation[0], init_orientation[1], init_orientation[2]))
+        # END CUSTOM: Share runtime initialization with normally spawned vehicles.
 
         # Body rigid prim — created lazily after simulation starts
         self._body_rigid_prim: RigidPrim | None = None
@@ -159,11 +173,17 @@ class Vehicle:
         self._cb_sim_state = SimulationManager.register_callback(self.update_sim_state, SimulationEvent.PHYSICS_POST_STEP)
 
 
+    # BEGIN CUSTOM: Allow explicit cleanup when a saved stage closes.
     def __del__(self):
-        """
-        Method that is invoked when a vehicle object gets destroyed. When this happens, we also invoke the
-        'remove_vehicle' from the VehicleManager in order to remove the vehicle from the list of active vehicles.
-        """
+        self._release_callbacks()
+
+    def close(self):
+        try:
+            self._on_sim_stopped()
+        finally:
+            self._release_callbacks()
+
+    def _release_callbacks(self):
         # Deregister all SimulationManager callbacks
         for cb_id in (self._cb_state, self._cb_update, self._cb_sensors, self._cb_sim_state,
                       self._cb_sim_start, self._cb_sim_stop):
@@ -179,8 +199,14 @@ class Vehicle:
             except Exception:
                 pass
 
-        # Remove this object from the vehicleHandler
-        VehicleManager.get_vehicle_manager().remove_vehicle(self._stage_prefix)
+        self._cb_state = self._cb_update = self._cb_sensors = self._cb_sim_state = None
+        self._cb_sim_start = self._cb_sim_stop = self._cb_render = None
+
+        path = getattr(self, "_stage_prefix", None)
+        manager = VehicleManager.get_vehicle_manager()
+        if path is not None and manager.get_vehicle(path) is self:
+            manager.remove_vehicle(path)
+    # END CUSTOM: Release runtime callbacks and preserve the USD prim.
 
     """
     Properties

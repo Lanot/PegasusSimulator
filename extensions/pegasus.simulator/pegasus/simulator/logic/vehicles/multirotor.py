@@ -70,6 +70,8 @@ class Multirotor(Vehicle):
         init_pos=[0.0, 0.0, 0.07],
         init_orientation=[0.0, 0.0, 0.0, 1.0],
         config=MultirotorConfig(),
+        *,
+        attach_existing: bool = False,
     ):
         """Initializes the multirotor object
 
@@ -83,7 +85,13 @@ class Multirotor(Vehicle):
         """
 
         # 1. Initiate the Vehicle object itself
-        super().__init__(stage_prefix, usd_file, init_pos, init_orientation, config.sensors, config.graphical_sensors, config.graphs, config.backends)
+        # BEGIN CUSTOM: Pass through the option to bind to a saved vehicle prim.
+        super().__init__(
+            stage_prefix, usd_file, init_pos, init_orientation,
+            config.sensors, config.graphical_sensors, config.graphs, config.backends,
+            attach_existing=attach_existing,
+        )
+        # END CUSTOM: Saved prim attachment.
 
         # 2. Setup the dynamics of the system - get the thrust curve of the vehicle from the configuration
         self._thrusters = config.thrust_curve

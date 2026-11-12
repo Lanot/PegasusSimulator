@@ -66,6 +66,14 @@ class Pegasus_SimulatorExtension(omni.ext.IExt):
         # BEGIN CUSTOM: Schedule PhysX preload when the saved MyPlot world opens.
         context = omni.usd.get_context()
         self._physx_preload_task = None
+        # BEGIN CUSTOM: Track the attached Iris for cleanup on stage close.
+        self._saved_iris = None
+        self._saved_iris_close_observer = carb.eventdispatcher.get_eventdispatcher().observe_event(
+            event_name=context.stage_event_name(omni.usd.StageEventType.CLOSING),
+            on_event=self._detach_saved_iris,
+            observer_name="pegasus.myplot_iris_close",
+        )
+        # END CUSTOM: Stage-scoped Iris runtime.
         self._physx_stage_observer = carb.eventdispatcher.get_eventdispatcher().observe_event(
             event_name=context.stage_event_name(omni.usd.StageEventType.OPENED),
             on_event=self._schedule_physx_preload,
@@ -98,10 +106,48 @@ class Pegasus_SimulatorExtension(omni.ext.IExt):
 
         scene = UsdPhysics.Scene.Get(stage, "/PhysicsScene")
         if stage.GetPrimAtPath("/World/MyPlotCollection") and scene and scene.GetPrim().IsActive():
+            # BEGIN CUSTOM: Restore the saved Iris backend before Play.
+            self._attach_saved_iris(stage)
+            # END CUSTOM: Existing simulation callbacks launch SITL.
             get_physx_interface().force_load_physics_from_usd()
             carb.log_warning("Pegasus: preloaded MyPlot PhysX scene before Play.")
     # END CUSTOM: MyPlot stage-open preload.
 
+
+    # BEGIN CUSTOM: Attach the saved MyPlot Iris to an ArduPilot SITL backend.
+    def _attach_saved_iris(self, stage):
+        from pegasus.simulator.logic.backends import ArduPilotMavlinkBackend, ArduPilotMavlinkBackendConfig
+        from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
+        from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
+        from pxr import UsdPhysics
+
+        path = "/World/MyDrones/quadrotor"
+        prim = stage.GetPrimAtPath(path)
+        if not prim or not prim.IsActive() or not prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            return
+
+        pegasus = PegasusInterface()
+        if pegasus.vehicle_manager.get_vehicle(path) is not None:
+            return
+
+        vehicle_id = 1
+        config = MultirotorConfig()
+        config.backends = [ArduPilotMavlinkBackend(config=ArduPilotMavlinkBackendConfig({
+            "vehicle_id": vehicle_id,
+            "ardupilot_autolaunch": True,
+            "ardupilot_dir": pegasus.ardupilot_path,
+            "ardupilot_vehicle_model": pegasus.ardupilot_default_airframe,
+        }))]
+        self._saved_iris = Multirotor(
+            path, vehicle_id=vehicle_id, config=config, attach_existing=True
+        )
+        carb.log_warn(f"Pegasus: attached ArduPilot SITL to saved Iris at {path} (ID {vehicle_id}).")
+
+    def _detach_saved_iris(self, event=None):
+        vehicle, self._saved_iris = self._saved_iris, None
+        if vehicle is not None:
+            vehicle.close()
+    # END CUSTOM: Release the live vehicle without deleting the saved prim.
 
     def show_window(self, menu, show):
         """
@@ -162,6 +208,11 @@ class Pegasus_SimulatorExtension(omni.ext.IExt):
             self._physx_preload_task.cancel()
             self._physx_preload_task = None
         # END CUSTOM: PhysX preload cleanup.
+
+        # BEGIN CUSTOM: Release the attached Iris when Pegasus shuts down.
+        self._saved_iris_close_observer = None
+        self._detach_saved_iris()
+        # END CUSTOM: Saved Iris runtime cleanup.
 
         # Destroy the isaac sim menu object
         self._menu = None

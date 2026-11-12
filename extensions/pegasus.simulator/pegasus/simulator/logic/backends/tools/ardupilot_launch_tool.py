@@ -12,6 +12,11 @@ import tempfile
 import subprocess
 import psutil
 
+# BEGIN CUSTOM: Dependencies for resolving the SITL home location.
+import math
+from pathlib import Path
+# END CUSTOM: SITL home dependencies.
+
 
 class ArduPilotLaunchTool:
     """
@@ -56,6 +61,65 @@ class ArduPilotLaunchTool:
     def _get_vehicle_frame(self):
         return self.ardupilot_model
     
+    # BEGIN CUSTOM: Use the stage's Cesium origin before consulting the SITL configuration.
+    @staticmethod
+    def _format_sitl_home(latitude, longitude, altitude, heading):
+        try:
+            values = tuple(float(value) for value in (latitude, longitude, altitude, heading))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        lat, lon, _, yaw = values
+        if all(map(math.isfinite, values)) and -90 <= lat <= 90 and -180 <= lon <= 180 and 0 <= yaw < 360:
+            return ",".join(str(value) for value in values)
+        return None
+
+    def _sitl_home(self):
+        try:
+            import omni.usd
+        except ModuleNotFoundError as error:
+            if error.name not in ("omni", "omni.usd"):
+                raise
+            stage = None
+        else:
+            stage = omni.usd.get_context().get_stage()
+        #print("\n\n_sitl_home\n\n")
+        georef = stage.GetPrimAtPath("/CesiumGeoreference") if stage is not None else None
+        #print("georef: ", georef)
+        if georef and georef.IsActive():
+            prefix = "cesium:georeferenceOrigin:"
+            coordinates = []
+            for name in ("latitude", "longitude", "height"):
+                attribute = georef.GetAttribute(prefix + name)
+                coordinates.append(attribute.Get() if attribute and attribute.HasAuthoredValueOpinion() else None)
+            home = self._format_sitl_home(*coordinates, 0.0)
+            if home is not None:
+                return home
+        #print("home: ", home)
+        import yaml
+
+        config_path = Path(__file__).resolve().parents[5] / "config" / "configs.yaml"
+        #print("config_path: ", config_path)
+
+        try:
+            with config_path.open(encoding="utf-8") as config_file:
+                settings = (yaml.safe_load(config_file) or {}).get("ardupilot_home")
+        except FileNotFoundError:
+            return None
+        if settings is None:
+            return None
+
+        home = self._format_sitl_home(
+            settings.get("latitude"), settings.get("longitude"),
+            settings.get("altitude", 0.0), settings.get("heading", 0.0),
+        )
+        #print("home: ", home)
+
+        if home is None:
+            raise ValueError("Invalid ardupilot_home in Pegasus configs.yaml")
+        return home
+    # END CUSTOM: Keep the ArduPilot default when neither source provides a location.
+
     def launch_ardupilot(self):
         """
         Method that will launch a ardupilot instance with the specified configuration
@@ -72,7 +136,15 @@ class ArduPilotLaunchTool:
             "-I", f"{self.vehicle_id}",
             "--sysid", f"{self.vehicle_id + 1}",
             "--out", f"udp:127.0.0.1:{14550 + self.vehicle_id * 10}",
+            # BEGIN CUSTOM: Forward MAVLink to local QGroundControl on every SITL launch.
+            "--out", "127.0.0.1:14550",
+            # END CUSTOM: QGroundControl telemetry forwarding.
         ]
+        # BEGIN CUSTOM: Pass the resolved home to sim_vehicle.py.
+        home = self._sitl_home()
+        if home is not None:
+            command.extend(["--custom-location", home])
+        # END CUSTOM: SITL home argument.
         command: str = " ".join(command)
         
         # Run in a seperate bash window
