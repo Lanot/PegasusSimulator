@@ -623,6 +623,11 @@ class ArduPilotMavlinkBackend(Backend):
 
         self._is_running = False
 
+        # BEGIN CUSTOM: Start each SITL connection disarmed with zero rotor commands.
+        self._armed = False
+        self._rotor_data.zero_input_reference()
+        # END CUSTOM: Clear commands from the previous simulation run.
+
         # Restart the sensor data
         self._sensor_data = SensorMsg()
 
@@ -672,41 +677,35 @@ class ArduPilotMavlinkBackend(Backend):
 
         carb.log_info("Pre Update")
 
-        _, servos = self.ap.pre_update(sim_time=self._current_utime)
+        # BEGIN CUSTOM: Keep the receive status so rejected frames never reach the rotors.
+        received, servos = self.ap.pre_update(sim_time=self._current_utime)
+        # END CUSTOM: Preserve servo frame validity.
 
         carb.log_info("Checking is Armed")
         self.update_is_armed()
         carb.log_info("Update Motor Commands")
-        self.update_motor_commands(servos)
+        self.update_motor_commands(servos, received=received)
 
         carb.log_info("Post Update")
         self.ap.post_update(sim_time=self._current_utime, sensor_data=self._sensor_data)
 
+    # BEGIN CUSTOM: Track disarm transitions and consume only fresh servo frames.
     def update_is_armed(self):
-        # Use this loop to emulate a do-while loop (make sure this runs at least once)
         msg = self._connection.recv_match(blocking=False)
+        if msg is None or msg.get_type() != "HEARTBEAT" or msg.type == mavutil.mavlink.MAV_TYPE_GCS:
+            return
 
-        # If a message was received
-        if msg is not None:
-            if not self._armed:
-                if (
-                    msg.get_type() == "HEARTBEAT"
-                    and msg.type != mavutil.mavlink.MAV_TYPE_GCS
-                ):
-                    is_armed = self._connection.motors_armed()
-                    if is_armed:
-                        self._armed = True
-                        carb.log_warn("Drone is armed.")
-                    else:
-                        if self._armed == True:
-                            carb.log_warn("Drone is Disarmed.")
-                        self._armed = False
+        is_armed = bool(self._connection.motors_armed())
+        if is_armed != self._armed:
+            carb.log_warn("Drone is armed." if is_armed else "Drone is disarmed.")
+            self._armed = is_armed
 
-    def update_motor_commands(self, servos):
-        if self._armed and servos != ():
-            self._rotor_data.update_input_reference(servos)
-        else:
+    def update_motor_commands(self, servos, *, received):
+        if not self._armed:
             self._rotor_data.zero_input_reference()
+        elif received:
+            self._rotor_data.update_input_reference(servos)
+    # END CUSTOM: Preserve motor references on skipped frames and clear on disarm.
 
     def send_heartbeat(self, mav_type=mavutil.mavlink.MAV_TYPE_GENERIC):
         """
